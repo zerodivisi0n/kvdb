@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/buger/jsonparser"
@@ -95,55 +97,87 @@ func loadFile(backend Backend, filename string, batchSize int) error {
 	}
 	defer gr.Close()
 
-	scanner := bufio.NewScanner(gr)
-	i := 0
-	records := make([]Record, 0, batchSize)
+	const (
+		parsersCount = 12
+		writersCount = 4
+	)
+
 	start := time.Now()
+	parserCh := make(chan []byte)
+	writerCh := make(chan Record)
+
+	var parsersWg sync.WaitGroup
+	for i := 0; i < parsersCount; i++ {
+		parsersWg.Add(1)
+		go func() {
+			for data := range parserCh {
+				var key, value []byte
+				keys := [][]string{
+					[]string{"name"},
+					[]string{"value"},
+				}
+				jsonparser.EachKey(data, func(idx int, val []byte, _ jsonparser.ValueType, err error) {
+					if err != nil {
+						log.Printf("parse index %d error: %v", idx, err)
+						return
+					}
+					if idx == 0 {
+						key = val
+					} else if idx == 1 {
+						value = val
+					}
+				}, keys...)
+				if len(key) > 0 && len(value) > 0 {
+					writerCh <- Record{
+						Key:   reverse(string(key)),
+						Value: copyBytes(value),
+					}
+				}
+			}
+			parsersWg.Done()
+		}()
+	}
+
+	var writersWg sync.WaitGroup
+	var totalRecords int64
+	for i := 0; i < writersCount; i++ {
+		writersWg.Add(1)
+		go func() {
+			records := make([]Record, 0, batchSize)
+			for r := range writerCh {
+				records = append(records, r)
+				if len(records) == batchSize {
+					if err := backend.Put(records); err != nil {
+						log.Printf("Failed to put records: %v", err)
+					}
+					records = records[:0]
+				}
+				if cnt := atomic.AddInt64(&totalRecords, 1); cnt%1000000 == 0 {
+					since := time.Since(start)
+					log.Printf("Put %d records in %v (%.2f rps)", cnt, since, float64(cnt)/since.Seconds())
+				}
+			}
+			if len(records) > 0 {
+				if err := backend.Put(records); err != nil {
+					log.Printf("Failed to put records: %v", err)
+				}
+			}
+			writersWg.Done()
+		}()
+	}
+
+	scanner := bufio.NewScanner(gr)
 	log.Printf("Start loading file")
 	for scanner.Scan() {
-		var key, value []byte
-		keys := [][]string{
-			[]string{"name"},
-			[]string{"value"},
-		}
-		var errs []error
-		jsonparser.EachKey(scanner.Bytes(), func(idx int, val []byte, _ jsonparser.ValueType, err error) {
-			if err != nil {
-				errs = append(errs, err)
-				return
-			}
-			if idx == 0 {
-				key = val
-			} else if idx == 1 {
-				value = val
-			}
-		}, keys...)
-		if errs != nil {
-			return fmt.Errorf("multiple errors: %v", errs)
-		}
-
-		records = append(records, Record{
-			Key:   reverse(string(key)),
-			Value: copyBytes(value),
-		})
-		i++
-		if len(records) == batchSize {
-			if err := backend.Put(records); err != nil {
-				return err
-			}
-			records = records[:0]
-		}
-		if i%1000000 == 0 {
-			log.Printf("Put %d records in %v", i, time.Since(start))
-		}
+		parserCh <- copyBytes(scanner.Bytes())
 	}
 
-	if len(records) > 0 {
-		if err := backend.Put(records); err != nil {
-			return err
-		}
-	}
+	close(parserCh)
+	parsersWg.Wait()
 
-	log.Printf("Load complete in %v", time.Since(start))
+	close(writerCh)
+	writersWg.Wait()
+
+	log.Printf("Loaded %d records in %v", totalRecords, time.Since(start))
 	return scanner.Err()
 }
