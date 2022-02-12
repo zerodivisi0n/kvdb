@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -26,6 +27,11 @@ type Backend interface {
 	Close() error
 }
 
+type JSONLine struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
 func main() {
 	var (
 		dbName        string
@@ -33,12 +39,14 @@ func main() {
 		inputFilename string
 		query         string
 		batchSize     int
+		jsonFmt       bool
 	)
 	flag.StringVar(&dbName, "db", "", "Database name")
 	flag.StringVar(&backendType, "backend", "badgerdb", "Database backend (leveldb, bbolt, badgerdb)")
 	flag.StringVar(&inputFilename, "i", "", "Input filename")
 	flag.StringVar(&query, "q", "", "Query subdomains")
 	flag.IntVar(&batchSize, "b", 5000, "Batch size")
+	flag.BoolVar(&jsonFmt, "json", false, "Print output as json")
 	flag.Parse()
 
 	if dbName == "" {
@@ -79,7 +87,16 @@ func main() {
 			log.Fatalf("Failed to search: %v", err)
 		}
 		for _, r := range records {
-			fmt.Printf("%s: %s\n", reverse(r.Key), strings.TrimSpace(string(r.Value)))
+			key := reverse(r.Key)
+			if !jsonFmt {
+				fmt.Printf("%s: %s\n", key, strings.TrimSpace(string(r.Value)))
+			} else {
+				output, err := json.Marshal(JSONLine{Key: key, Value: string(r.Value)})
+				if err != nil {
+					log.Fatal(err)
+				}
+				fmt.Println(string(output))
+			}
 		}
 	}
 }
