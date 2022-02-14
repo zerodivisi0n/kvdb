@@ -28,23 +28,26 @@ type Backend interface {
 }
 
 type JSONLine struct {
+	Query string `json:"query"`
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }
 
 func main() {
 	var (
-		dbName        string
-		backendType   string
-		inputFilename string
-		query         string
-		batchSize     int
-		jsonFmt       bool
+		dbName           string
+		backendType      string
+		inputFilename    string
+		query            string
+		queryConcurrency int
+		batchSize        int
+		jsonFmt          bool
 	)
 	flag.StringVar(&dbName, "db", "", "Database name")
 	flag.StringVar(&backendType, "backend", "badgerdb", "Database backend (leveldb, bbolt, badgerdb)")
 	flag.StringVar(&inputFilename, "i", "", "Input filename")
-	flag.StringVar(&query, "q", "", "Query subdomains")
+	flag.StringVar(&query, "q", "", "Comma-separated query string")
+	flag.IntVar(&queryConcurrency, "c", 10, "Query concurrency")
 	flag.IntVar(&batchSize, "b", 5000, "Batch size")
 	flag.BoolVar(&jsonFmt, "json", false, "Print output as json")
 	flag.Parse()
@@ -81,21 +84,81 @@ func main() {
 		}
 	}
 
-	if query != "" {
-		records, err := backend.Search(reverse(query))
-		if err != nil {
-			log.Fatalf("Failed to search: %v", err)
+	queryParts := strings.Split(query, ",")
+	queryTerms := queryParts[:0]
+	for _, q := range queryParts {
+		if len(q) > 0 {
+			queryTerms = append(queryTerms, q)
 		}
-		for _, r := range records {
-			key := reverse(r.Key)
-			if !jsonFmt {
-				fmt.Printf("%s: %s\n", key, strings.TrimSpace(string(r.Value)))
-			} else {
-				output, err := json.Marshal(JSONLine{Key: key, Value: string(r.Value)})
-				if err != nil {
-					log.Fatal(err)
+	}
+	if len(queryTerms) > 0 {
+		concurrency := queryConcurrency
+		if l := len(queryTerms); l < concurrency {
+			concurrency = l
+		}
+		type queryResult struct {
+			query   string
+			records []Record
+			err     error
+		}
+		var results []queryResult
+		if concurrency == 1 {
+			for _, q := range queryTerms {
+				records, err := backend.Search(reverse(q))
+				results = append(results, queryResult{
+					query:   q,
+					records: records,
+					err:     err,
+				})
+			}
+		} else {
+			queryCh := make(chan string)
+			outCh := make(chan queryResult)
+			var wg sync.WaitGroup
+			for i := 0; i < concurrency; i++ {
+				wg.Add(1)
+				go func() {
+					for q := range queryCh {
+						records, err := backend.Search(reverse(q))
+						outCh <- queryResult{
+							query:   q,
+							records: records,
+							err:     err,
+						}
+					}
+					wg.Done()
+				}()
+			}
+
+			go func() {
+				for res := range outCh {
+					results = append(results, res)
 				}
-				fmt.Println(string(output))
+			}()
+
+			for _, q := range queryTerms {
+				queryCh <- q
+			}
+			close(queryCh)
+			wg.Wait()
+			close(outCh)
+		}
+		for _, res := range results {
+			if res.err != nil {
+				log.Printf("Failed to search '%s': %v", res.query, res.err)
+				continue
+			}
+			for _, r := range res.records {
+				key := reverse(r.Key)
+				if !jsonFmt {
+					fmt.Printf("%s: %s\n", key, strings.TrimSpace(string(r.Value)))
+				} else {
+					output, err := json.Marshal(JSONLine{Query: res.query, Key: key, Value: string(r.Value)})
+					if err != nil {
+						log.Fatal(err)
+					}
+					fmt.Println(string(output))
+				}
 			}
 		}
 	}
